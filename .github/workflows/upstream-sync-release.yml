@@ -91,14 +91,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: PlatinumMaster/BeaterLibrary
+          ref: eae45a67405a9541e5676e03bfbde644f8c51162
           path: BeaterLibrary
       - uses: actions/checkout@v4
         with:
           repository: PlatinumMaster/Hotswap
+          ref: 10c74328e00dc994fd739733a6b4645504184fb5
           path: Hotswap
       - uses: actions/checkout@v4
         with:
           repository: PlatinumMaster/NitroSharp
+          ref: 2287b99b7c926eff1db237e0467f59917c0f045e
           path: NitroSharp
       - uses: actions/setup-dotnet@v4
         with:
