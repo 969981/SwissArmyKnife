@@ -1,0 +1,149 @@
+name: Sync upstream and release (SwissArmyKnife)
+
+on:
+  schedule:
+    - cron: '43 */6 * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/upstream-sync-release.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-auto-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Fetch upstream branches and tags
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.sync.outputs.should_release }}
+      commit_sha: ${{ steps.sync.outputs.commit_sha }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      release_tag: ${{ steps.sync.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Synchronize without overwriting downstream workflow
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE: PlatinumMaster/SwissArmyKnife
+          BASE: avalonia
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/$SOURCE.git"
+          git fetch --prune --tags upstream '+refs/heads/*:refs/remotes/upstream/*'
+          upstream_sha="$(git rev-parse "refs/remotes/upstream/$BASE")"
+          old_head="$(git rev-parse HEAD)"
+          git merge --no-edit "refs/remotes/upstream/$BASE"
+          commit_sha="$(git rev-parse HEAD)"
+          if [[ "$commit_sha" != "$old_head" ]]; then
+            git push origin "HEAD:refs/heads/$BASE"
+            echo "Updated $BASE from $old_head to $commit_sha"
+          fi
+
+          # Update additional upstream branches only by fast-forward: never force-delete or overwrite local work.
+          while IFS= read -r branch; do
+            [[ "$branch" == "$BASE" || "$branch" == "HEAD" ]] && continue
+            git push origin "refs/remotes/upstream/$branch:refs/heads/$branch"
+          done < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream)
+
+          # Preserve upstream tags; conflict on a rewritten tag is a deliberate hard failure.
+          git push origin --tags
+
+          tag="upstream-$(printf '%s' "$upstream_sha" | cut -c1-12)"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$commit_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "Release $tag already exists; no duplicate build."
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "Release $tag missing; build and publish (also retries previous build failures)."
+          fi
+
+  build:
+    name: Build ${{ matrix.rid }}
+    needs: sync
+    if: needs.sync.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit_sha }}
+          path: SwissArmyKnife
+      - uses: actions/checkout@v4
+        with:
+          repository: PlatinumMaster/BeaterLibrary
+          path: BeaterLibrary
+      - uses: actions/checkout@v4
+        with:
+          repository: PlatinumMaster/Hotswap
+          path: Hotswap
+      - uses: actions/checkout@v4
+        with:
+          repository: PlatinumMaster/NitroSharp
+          path: NitroSharp
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+      - name: Publish SwissArmyKnife
+        shell: pwsh
+        run: dotnet publish SwissArmyKnife/SwissArmyKnife.Avalonia.csproj -c Release -f net6.0 -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=false -o "dist/${{ matrix.rid }}"
+      - name: Create portable archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path packages -Force | Out-Null
+          Compress-Archive -Path "dist/${{ matrix.rid }}/*" -DestinationPath "packages/SwissArmyKnife-${{ matrix.rid }}.zip" -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SwissArmyKnife-${{ matrix.rid }}
+          path: packages/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [sync, build]
+    if: needs.sync.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: SwissArmyKnife-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create release only after all builds succeeded
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.sync.outputs.release_tag }}
+          SHA: ${{ needs.sync.outputs.commit_sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(release-assets/*.zip)
+          (( ${#assets[@]} > 0 ))
+          gh release create "$TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "SwissArmyKnife auto build ($TAG)" \
+            --notes "Automated verified build from upstream PlatinumMaster/SwissArmyKnife at commit $UPSTREAM_SHA. Built from downstream commit $SHA. This is an unofficial automated build, not an upstream release." \
+            --prerelease
