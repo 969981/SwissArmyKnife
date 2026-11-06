@@ -1,6 +1,7 @@
 name: SwissArmyKnife.Avalonia
 
-on: [push]
+on:
+  workflow_dispatch: # Legacy workflow retained for manual use only; automated builds use upstream-sync-release.yml
 
 jobs:
   build:
